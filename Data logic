@@ -1,0 +1,807 @@
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(wordcloud)
+library(tibble)
+library(tidytext)
+library(tidyr)
+library(stringr)
+library(pdftools)
+library(tm)
+library(dataMaid)
+library(DataExplorer)
+library(rvest)
+library(cluster)
+library(factoextra)
+library(Matrix)
+library(reshape2)
+library(fpc)
+library(mclust)
+library(leaps)
+library(bestglm)
+library(caret)
+
+
+#data loading and cleaning
+
+
+#load data
+first = read.csv("winemag-data_first150k.csv")
+
+second = read.csv("winemag-data-130k-v2.csv")
+
+
+
+#merge two data sets
+a = right_join(first, second, by=c("description","country","points","price","province", "region_1", "region_2","variety", "winery","designation"))
+
+
+#filter for price greater than 15
+b = a %>% filter(price >= 15)
+
+#remove unneeded columns
+c = subset(b, select = -c(X.x, region_2, X.y))
+
+
+#make sure there are no duplicates
+d = distinct(c, title, .keep_all = TRUE)
+
+
+#remove NAs
+e = d %>%
+  filter(!is.na(price))
+
+#remove blanks
+f = subset(e, description != "" | points != "" | price != "" | variety != "" | title != "" | taster_name != "")
+
+#preliminary data exploration
+
+
+introduce(f)
+
+plot_bar(f)
+
+plot_histogram(f)
+
+# plotting points
+f %>% ggplot(aes(x = points)) + 
+  geom_histogram(
+    bins = nrow(f %>% distinct(points)),
+    colour = "white",
+    fill = "#59121C"
+  )
+
+#plotting prices
+f %>% ggplot(aes(x = price)) + 
+  geom_histogram(
+    bins = nrow(f %>% distinct(points)),
+    colour = "white",
+    fill = "#59121C"
+  )+ xlim(0,200)
+
+
+
+#CLASSIFYING BY RED AND WHITE
+
+#loading wiki wine color data - some of source code was inspired by https://mdneuzerling.com/post/scraping-wine-colours-with-r/
+
+wiki_tables <- "https://en.wikipedia.org/w/index.php?title=List_of_grape_varieties&oldid=847983339" %>% 
+  read_html %>% 
+  html_nodes("table")
+red_wines <- wiki_tables[[1]] %>% html_table %>% cbind(colour = "red")
+white_wines <- wiki_tables[[2]] %>% html_table %>% cbind(colour = "white")
+rose_wines <- wiki_tables[[3]] %>% html_table %>% cbind(colour = "rosé")
+all_wines <- rbind(red_wines, white_wines, rose_wines)
+wine_colors = all_wines %>% 
+  select(`Common Name(s)`, `All Synonyms`, colour)
+
+
+#lowercase and select columns
+all_wines <- wine_colors %>% 
+  rename(
+    common_names = `Common Name(s)`,
+    synonyms = `All Synonyms`
+  ) %>% 
+  mutate_all(tolower) %>% 
+  select(common_names, synonyms, colour)
+
+
+#split the common names
+common_names <- all_wines %>%
+  unnest(common_names = strsplit(common_names, " / ")) %>% # split common names into separate rows
+  rename(variety = common_names) %>% 
+  mutate(
+    variety = gsub("\\.", "", variety), # remove periods 
+    variety = gsub("\\s*\\([^\\)]+\\)", "", variety), # remove brackets and anything within
+    variety = gsub("\\s*\\[[^\\)]+\\]", "", variety) # same for square brackets
+  ) %>% 
+  select(variety, colour)
+
+#split the synonyms
+synonyms <- all_wines %>% 
+  unnest(synonyms = strsplit(synonyms, ", ")) %>% # split the synonyms into multiple rows
+  rename(variety = synonyms) %>% 
+  mutate(
+    variety = gsub("\\.", "", variety), # remove periods 
+    variety = gsub("\\s*\\([^\\)]+\\)", "", variety), # remove brackets and anything within
+    variety = gsub("\\s*\\[[^\\)]+\\]", "", variety) # same for square brackets
+  ) %>% 
+  select(variety, colour) %>% 
+  anti_join(common_names, by = "variety") # remove synonyms if we have a common name
+
+#join synonyms and common names
+variety_colours <- rbind(common_names, synonyms) %>% 
+  distinct %>% 
+  arrange(variety)
+
+
+f$variety = tolower(f$variety)
+
+
+#create function for joining
+g = function(f, variety_colours) {
+  f %>% 
+    left_join(
+      variety_colours %>% select(variety, colour),
+      by = "variety"
+    ) %>% 
+    mutate(
+      colour = case_when(
+        !is.na(colour) ~ colour,
+        grepl("sparkling", variety, ignore.case = TRUE) ~ "white",
+        grepl("champagne", variety, ignore.case = TRUE) ~ "white",
+        grepl("red", variety, ignore.case = TRUE) ~ "red",
+        grepl("white", variety, ignore.case = TRUE) ~ "white",
+        grepl("rosé", variety, ignore.case = TRUE) ~ "rosé",
+        grepl("rose", variety, ignore.case = TRUE) ~ "rosé"
+      )
+    )
+}
+
+#join for color
+wine_colours = f %>% g(variety_colours)
+
+
+#remove NAs
+wine_colours = wine_colours %>% drop_na(colour)
+
+
+###TEXT MINING ON WINES
+
+wines = subset(wine_colours, select = c(description, variety))
+
+reds = wine_colours %>% filter(colour == "red")
+
+
+
+whites = wine_colours %>% filter(colour == "white")
+
+
+
+
+
+#create documents
+
+wines$doc_id = c(1:nrow(wines))
+
+wines$text = as.character(wines$description)
+
+#clean descriptions
+#custom stop words
+
+custom_stopwords = c("will","malbec","gris","made","–","vineyard","riesling","pinot", "noir","chardonnay","zinfandel","delivers","character","texture","well","cabernet","merlot","sauvignon","fruit","fruits","now","drink","palate","offers","shows","wine","winery", "vintage","where", "when","finish","and", "but","flavors","flavor","aroma","aromas","taste","tastes","nose","note","notes", "alvarinho", "raboso", "rosenmuskateller", "traminer", "grolleau", "sercial", "moscato", "red", "white", "blend")
+wine_stopwords= data.frame(custom_stopwords,"Custom")
+colnames(wine_stopwords) = c("word","lexicon")
+
+#lowercase descriptions
+
+wines$text = tolower(wines$text)
+
+#tokenize descriptions
+
+
+tokenize = wines %>%
+  select(doc_id, text, description, variety) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(wine_stopwords) %>% 
+  filter(!str_detect(word, "[0-9]"))
+
+tokenized = tokenize %>%
+ anti_join(stop_words)
+
+##TF-IDF
+#count words by variety
+word_counts = tokenized %>%
+  count(variety, word, sort = TRUE)
+
+#find top varieties
+top_varieties = tokenized %>% 
+  group_by(variety) %>%
+  count(word) %>%
+  summarise(sum = sum(n)) %>%
+  top_n(-280)
+
+#remove bottom varieties
+
+word_counts = word_counts %>%
+  anti_join(top_varieties, by = "variety")
+
+
+
+
+#perform tf_idf comparing variety
+tf_idf = word_counts  %>%
+  bind_tf_idf(word, variety, n) %>%
+  arrange(desc(tf_idf))
+
+#k-means clustering
+
+#average Tf_idf scores
+averages = tf_idf %>%
+  group_by(variety, word) %>%
+  summarise_at(vars(tf_idf), funs(mean(., na.rm=TRUE)))
+
+#remove NA,NAN, INF
+averages = averages[complete.cases(averages),]
+averages[apply(sapply(averages, is.finite), 1, all),]
+
+
+
+#transpose data
+distance = dcast(averages, variety ~ word)
+
+distance[is.na(distance)] <- 0
+
+row.names(distance) <- distance$variety
+
+
+
+#change row names
+#first cluster
+distMatrix <- dist(distance, method="euclidean")
+
+groups <- hclust(distMatrix,method="ward.D")
+
+plot(groups, cex=0.9, hang=-1)
+
+rect.hclust(groups, k=10, border="red")
+
+
+#determine best fit number of clusters
+
+
+# Run the function to see how many clusters
+# it finds to be optimal, set it to search for
+# at least 1 model and up 20.
+d_clust <- Mclust(distMatrix, G=1:20)
+m.best <- dim(d_clust$z)[2]
+cat("model-based optimal number of clusters:", m.best, "\n")
+plot(d_clust)
+
+#REDS ANALYSIS
+
+reds$doc_id = c(1:nrow(reds))
+reds$text = as.character(reds$description)
+
+
+
+#clean descriptions
+#custom stop words
+
+custom_stopwords = c("will","malbec","gris","made","–","vineyard","riesling","pinot", "noir","chardonnay","zinfandel","delivers","character","texture","well","cabernet","merlot","sauvignon","fruit","fruits","now","drink","palate","offers","shows","wine","winery", "vintage","where", "when","finish","and", "but","flavors","flavor","aroma","aromas","taste","tastes","nose","note","notes", "alvarinho", "raboso", "rosenmuskateller", "traminer", "grolleau", "sercial", "moscato", "red", "white", "blend", "acidity")
+wine_stopwords= data.frame(custom_stopwords,"Custom")
+colnames(wine_stopwords) = c("word","lexicon")
+
+#lowercase descriptions
+
+reds$text = tolower(reds$text)
+
+#tokenize descriptions
+
+
+tokenize_reds = reds %>%
+  select(doc_id, text, description, variety) %>%
+  unnest_tokens(word, text) 
+
+tokenize_reds = tokenize_reds %>%
+  anti_join(wine_stopwords, by="word") %>% 
+  filter(!str_detect(word, "[0-9]"))
+
+
+
+tokenized_reds = tokenize_reds %>%
+  anti_join(stop_words, by="word")
+
+##TF-IDF
+#count words by variety
+word_counts_reds = tokenized_reds %>%
+  count(variety, word, sort = TRUE)
+
+#find top varieties
+top_varieties_reds = tokenized_reds %>% 
+  group_by(variety) %>%
+  count(word) %>%
+  summarise(sum = sum(n)) %>%
+  top_n(-109)
+
+
+#remove bottom varieties
+
+word_counts_reds_top = word_counts_reds %>%
+  anti_join(top_varieties_reds, by = "variety")
+
+
+
+
+
+#perform tf_idf comparing variety
+tf_idf_reds = word_counts_reds_top  %>%
+  bind_tf_idf(word, variety, n) %>%
+  arrange(desc(tf_idf))
+
+#k-means clustering
+
+#average Tf_idf scores
+averages_reds = tf_idf_reds %>%
+  group_by(variety, word) %>%
+  summarise_at(vars(tf_idf), funs(mean(., na.rm=TRUE)))
+
+#remove NA,NAN, INF
+averages_reds = averages_reds[complete.cases(averages_reds),]
+averages_reds[apply(sapply(averages_reds, is.finite), 1, all),]
+
+
+
+#transpose data
+distance_reds = dcast(averages_reds, variety ~ word)
+
+distance_reds[is.na(distance_reds)] <- 0
+
+#change row names
+row.names(distance_reds) <- distance_reds$variety
+
+
+
+
+#cluster reds
+distMatrix_reds <- dist(distance_reds, method="euclidean")
+
+groups_reds_4 <- hclust(distMatrix_reds,method="ward.D")
+
+plot(groups_reds_4, cex=0.9, hang=-1)
+
+rect.hclust(groups_reds_4, k=4, border="red")
+
+
+
+# Run the function to see how many clusters
+# it finds to be optimal, set it to search for
+# at least 1 model and up 20.
+d_clust_reds <- Mclust(distMatrix_reds, G=1:20)
+m.best_reds <- dim(d_clust_reds$z)[2]
+cat("model-based optimal number of clusters:", m.best_reds, "\n")
+plot(d_clust_reds)
+
+#cut tree
+cut_red = cutree(groups_reds_4, k=4)
+
+
+##rename variety column
+x = distance_reds
+
+colnames(x)[1] <- "wine_type"
+
+x = x %>% rename(blank_space = variety)
+
+
+colnames(x)[1] <- "variety"
+
+
+##add clusters to varietites
+segment_reds <- mutate(x, cluster = cut_red)
+
+#select on wine variety and cluster
+cluster_reds = segment_reds %>% select(variety, cluster)
+
+
+
+##join with original tokenization
+
+reds_cluster_counts = word_counts_reds %>% left_join(cluster_reds, by ="variety")
+
+#TF-IDF on clusters
+
+tf_idf_reds_cluster = reds_cluster_counts  %>%
+  bind_tf_idf(word, cluster, n) %>%
+  arrange(desc(tf_idf))
+
+#G1 TF-IDF
+
+g1_reds_tf_idf = tf_idf_reds_cluster %>% filter(cluster == 1)
+
+#G2 TF-IDF
+
+g2_reds_tf_idf = tf_idf_reds_cluster %>% filter(cluster == 2)
+
+#g3 TF-IDF
+
+g3_reds_tf_idf = tf_idf_reds_cluster %>% filter(cluster == 3)
+
+#g4 TF-IDF
+
+g4_reds_tf_idf = tf_idf_reds_cluster %>% filter(cluster == 4)
+
+
+##word cloud group 1
+reds_g1 = reds_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 1 && word != "tannins"  && word != "cherry" && word != "black" && word != "acidity") %>%
+  summarise(n = sum(n))
+
+
+
+set.seed(1234)
+wordcloud(words = reds_g1$word, freq = reds_g1$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+#word cloud group 2
+
+reds_g2 = reds_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 2 && word != "tannins"  && word != "cherry" && word != "black") %>%
+  summarise(n = sum(n))
+
+
+set.seed(1234)
+wordcloud(words = reds_g2$word, freq = reds_g2$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+
+
+#word cloud group 3
+
+reds_g3 = reds_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 3 && word != "tannins"  && word != "cherry" && word != "black") %>%
+  summarise(n = sum(n))
+
+
+set.seed(1234)
+wordcloud(words = reds_g3$word, freq = reds_g3$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+#word cloud group 4
+
+reds_g4 = reds_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 4 && word != "tannins"  && word != "cherry" && word != "black") %>%
+  summarise(n = sum(n))
+
+
+
+set.seed(1234)
+wordcloud(words = reds_g4$word, freq = reds_g4$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+
+View(g4_reds_tf_idf)
+##WHITES ANALYSIS
+
+whites$doc_id = c(1:nrow(whites))
+
+whites$text = as.character(whites$description)
+
+
+
+#clean descriptions
+#lowercase descriptions
+
+whites$text = tolower(whites$text)
+
+#tokenize descriptions
+
+
+tokenize_whites = whites %>%
+  select(doc_id, text, description, variety) %>%
+  unnest_tokens(word, text) 
+
+tokenize_whites = tokenize_whites %>%
+  anti_join(wine_stopwords, by="word") %>% 
+  filter(!str_detect(word, "[0-9]"))
+
+
+
+tokenized_whites = tokenize_whites %>%
+  anti_join(stop_words, by="word")
+
+##TF-IDF
+#count words by variety
+word_counts_whites = tokenized_whites %>%
+  count(variety, word, sort = TRUE)
+
+#find top varieties
+top_varieties_whites = tokenized_whites %>% 
+  group_by(variety) %>%
+  count(word) %>%
+  summarise(sum = sum(n)) %>%
+  top_n(-165)
+
+
+#remove bottom varieties
+
+word_counts_whites_top = word_counts_whites %>%
+  anti_join(top_varieties_whites, by = "variety")
+
+
+
+
+
+#perform tf_idf comparing variety
+tf_idf_whites = word_counts_whites_top  %>%
+  bind_tf_idf(word, variety, n) %>%
+  arrange(desc(tf_idf))
+
+#k-means clustering
+
+#average Tf_idf scores
+averages_whites = tf_idf_whites %>%
+  group_by(variety, word) %>%
+  summarise_at(vars(tf_idf), funs(mean(., na.rm=TRUE)))
+
+#remove NA,NAN, INF
+averages_whites = averages_whites[complete.cases(averages_whites),]
+averages_whites[apply(sapply(averages_whites, is.finite), 1, all),]
+
+
+
+#transpose data
+distance_whites = dcast(averages_whites, variety ~ word)
+
+distance_whites[is.na(distance_whites)] <- 0
+
+#change row names
+row.names(distance_whites) <- distance_whites$variety
+
+
+
+
+#cluster whites
+
+distMatrix_whites <- dist(distance_whites, method="euclidean")
+
+groups_whites_4 <- hclust(distMatrix_whites,method="ward.D")
+
+plot(groups_whites_4, cex=0.9, hang=-1)
+
+rect.hclust(groups_whites_4, k=5, border="red")
+
+# Run the function to see how many clusters
+# it finds to be optimal, set it to search for
+# at least 1 model and up 20.
+d_clust_whites <- Mclust(distMatrix_whites, G=1:20)
+m.best_whites <- dim(d_clust_whites$z)[2]
+cat("model-based optimal number of clusters:", m.best_whites, "\n")
+plot(d_clust_whites)
+
+#cut tree
+
+cut_whites = cutree(groups_whites_4, k=5)
+
+
+##rename variety column
+y = distance_whites
+
+colnames(y)[1] <- "wine_type"
+
+y = y %>% rename(blank_space = variety)
+
+
+colnames(y)[1] <- "variety"
+
+
+##add clusters to varietites
+segment_whites <- mutate(y, cluster = cut_whites)
+
+#select on wine variety and cluster
+cluster_whites = segment_whites %>% select(variety, cluster)
+
+View(cluster_whites)
+
+##join with original tokenization
+
+whites_cluster_counts = word_counts_whites %>% left_join(cluster_whites, by ="variety")
+
+#TF-IDF on clusters
+
+tf_idf_whites_cluster = whites_cluster_counts  %>%
+  bind_tf_idf(word, cluster, n) %>%
+  arrange(desc(tf_idf))
+
+#G1 TF-IDF
+
+g1_whites_tf_idf = tf_idf_whites_cluster %>% filter(cluster == 1)
+
+#G2 TF-IDF
+
+g2_whites_tf_idf = tf_idf_whites_cluster %>% filter(cluster == 2)
+
+#g3 TF-IDF
+
+g3_whites_tf_idf = tf_idf_whites_cluster %>% filter(cluster == 3)
+
+#g4 TF-IDF
+
+g4_whites_tf_idf = tf_idf_whites_cluster %>% filter(cluster == 4)
+
+#g5 TF-IDF
+
+g5_whites_tf_idf = tf_idf_whites_cluster %>% filter(cluster == 5)
+
+
+##word cloud group 1
+whites_g1 = whites_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 1 && word != "tannins"  && word != "cherry" && word != "black") %>%
+  summarise(n = sum(n))
+
+
+
+set.seed(1234)
+wordcloud(words = whites_g1$word, freq = whites_g1$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+#word cloud group 2
+
+whites_g2 = whites_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 2 && word != "tannins"  && word != "cherry" && word != "black") %>%
+  summarise(n = sum(n))
+
+
+set.seed(1234)
+wordcloud(words = whites_g2$word, freq = whites_g2$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+#word cloud group 3
+
+whites_g3 = whites_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 3 && word != "tannins"  && word != "cherry" && word != "black" && word != "prosecco") %>%
+  summarise(n = sum(n))
+
+
+set.seed(1234)
+wordcloud(words = whites_g3$word, freq = whites_g3$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+#word cloud group 4
+
+whites_g4 = whites_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 4 && word != "tannins"  && word != "cherry" && word != "black" && word != "roussanne" && word != "grenache" && word != "blanc") %>%
+  summarise(n = sum(n))
+
+
+
+set.seed(1234)
+wordcloud(words = whites_g4$word, freq = whites_g4$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+
+##word cloud group 5
+whites_g5 = whites_cluster_counts %>% 
+  group_by(cluster, word) %>% filter(cluster == 5 && word != "tannins"  && word != "cherry" && word != "black") %>%
+  summarise(n = sum(n))
+
+
+
+set.seed(1234)
+wordcloud(words = whites_g5$word, freq = whites_g5$n, min.freq = 1,
+          max.words=50, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+
+##REGRESSION ANALYSIS
+
+#renaming white clusters
+
+cluster_whites$cluster[cluster_whites$cluster == 5] = 9
+cluster_whites$cluster[cluster_whites$cluster == 4] = 8
+cluster_whites$cluster[cluster_whites$cluster == 3] = 7
+cluster_whites$cluster[cluster_whites$cluster == 2] = 6
+cluster_whites$cluster[cluster_whites$cluster == 1] = 5
+
+#join with original wine listing
+#red join
+clustered_wines = wine_colours %>% left_join(cluster_reds, by = "variety" )
+#white join
+clustered_wines = clustered_wines %>% left_join(cluster_whites, by = "variety")
+
+
+
+#change NA to 0
+clustered_wines$cluster.x[is.na(clustered_wines$cluster.x)] = 0
+clustered_wines$cluster.y[is.na(clustered_wines$cluster.y)] = 0
+
+#create final cluster column
+clustered_wines = clustered_wines %>% mutate(cluster = cluster.x + cluster.y)
+
+final = clustered_wines
+
+#remove intermediate cluster columns and other columns not needed for the regression
+
+clustered_wines = subset(clustered_wines, select = -c(cluster.x, cluster.y, designation, description, taster_twitter_handle, variety, title, winery, title, province, region_1))
+
+#factorizing cluster variables
+clustered_wines$cluster = as.factor(clustered_wines$cluster)   
+
+#training and testing data sets
+set.seed(1)
+row.number <- sample(1:nrow(clustered_wines), 0.7*nrow(clustered_wines))
+train = clustered_wines[row.number,]
+test = clustered_wines[-row.number,]
+
+#run regression
+model1 <- lm(points ~., data=train) 
+
+summary(model1)
+
+#exhaustive search
+leaps<-regsubsets(points~.,data=train,nbest=3, really.big = T)
+
+summary(leaps)
+
+plot(leaps,scale="r2")
+
+#remove taster
+
+train2 = subset(train, select = -c(taster_name))
+
+#exhaustive search
+
+leaps2 = regsubsets(points~.,data=train2,nbest=3, really.big = T)
+
+plot(leaps2,scale="r2")
+summary(leaps2)
+
+
+#get formula from best model - found at http://www.sthda.com/english/articles/37-model-selection-essentials-in-r/155-best-subsets-regression-essentials-in-r/
+
+get_model_formula <- function(id, object, outcome){
+  # get models data
+  models <- summary(object)$which[id,-1]
+  # Get outcome variable
+  #form <- as.formula(object$call[[2]])
+  #outcome <- all.vars(form)[1]
+  # Get model predictors
+  predictors <- names(which(models == TRUE))
+  predictors <- paste(predictors, collapse = "+")
+  # Build model formula
+  as.formula(paste0(outcome, "~", predictors))
+}
+get_model_formula(20, leaps2, "points")
+
+coef(leaps2, 20)
+
+#run predictions
+predict.regsubsets = function(object,newdata,id,...){
+  form = as.formula(object$call[[2]]) # Extract the formula used when we called regsubsets()
+  mat = model.matrix(form,newdata)    # Build the model matrix
+  coefi = coef(object,id=id)          # Extract the coefficiants of the ith model
+  xvars = names(coefi)                # Pull out the names of the predictors used in the ith model
+  mat[,xvars]%*%coefi               # Make predictions using matrix multiplication
+}
+w = predict.regsubsets(leaps, test, id = 20)
+z = predict.regsubsets(leaps, test, id = 3)
+
+
+#RMSE
+RMSE(w, test$points)
+RMSE(z, test$points)
+##R^2
+R2(w, test$points)
+R2(z, test$points)
+
+##sample run through
+
+l = final %>% filter(colour == "white" & cluster==6  & price < 50) %>%
+  sample_n(1)
